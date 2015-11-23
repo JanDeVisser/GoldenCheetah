@@ -23,6 +23,7 @@
 #include <QSqlDatabase>
 #include <QTreeWidget>
 #include <QtGui>
+#include <QUuid>
 #include <QNetworkReply>
 #include <QHeaderView>
 
@@ -51,6 +52,7 @@ class PMCData;
 class LTMSettings;
 class Routes;
 class AthleteDirectoryStructure;
+class RideImportWizard;
 class RideAutoImportConfig;
 class RideCache;
 class IntervalCache;
@@ -72,6 +74,7 @@ class Athlete : public QObject
 
         // basic athlete info
         QString cyclist; // the cyclist name
+        QUuid id; // unique identifier
         bool useMetricUnits;
         AthleteDirectoryStructure *home;
         const AthleteDirectoryStructure *directoryStructure() const {return home; }
@@ -118,7 +121,8 @@ class Athlete : public QObject
         CalDAV *davCalendar;
 #endif
 
-        // Athlete's autoimport configuration
+        // Athlete's autoimport handling
+        RideImportWizard *autoImport;
         RideAutoImportConfig *autoImportConfig;
 
         // ride metadata definitions

@@ -655,8 +655,6 @@ RideFile *RideFileFactory::openRideFile(Context *context, QFile &file,
             i->stop -= timeOffset;
         }
 
-        DataProcessorFactory::instance().autoProcess(result);
-
         // calculate derived data series -- after data fixers applied above
         if (context) result->recalculateDerivedSeries();
 
@@ -1753,7 +1751,7 @@ RideFile::recalculateDerivedSeries(bool force)
 
     // wheelsize - use meta, then config then drop to 2100
     double wheelsize = getTag(tr("Wheelsize"), "0.0").toDouble();
-    if (wheelsize == 0) wheelsize = appsettings->value(this, GC_WHEELSIZE, 2100).toInt();
+    if (wheelsize == 0) wheelsize = appsettings->cvalue(context->athlete->cyclist, GC_WHEELSIZE, 2100).toInt();
     wheelsize /= 1000.00f; // need it in meters
 
     // last point looked at

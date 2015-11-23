@@ -78,7 +78,7 @@ ride: '{' rideelement_list '}'                                  {
                                                                     if (jc->api != NULL) {
                                                                     #ifdef GC_WANT_HTTP
                                                                         // we're listing rides in the api
-                                                                        jc->api->writeRideLine(jc->wanted, jc->item, jc->request, jc->response);
+                                                                        jc->api->writeRideLine(jc->item, jc->request, jc->response);
                                                                     #endif
                                                                     } else {
 
@@ -468,11 +468,34 @@ void RideCache::save()
 }
 
 #ifdef GC_WANT_HTTP
+#include "RideMetadata.h"
+
 void
 APIWebService::listRides(QString athlete, HttpRequest &request, HttpResponse &response)
 {
+    listRideSettings settings;
+
+    // the ride db
+    QString ridedb = QString("%1/%2/cache/rideDB.json").arg(home.absolutePath()).arg(athlete);
+    QFile rideDB(ridedb);
+
     // list activities and associated metrics
     response.setHeader("Content-Type", "text; charset=ISO-8859-1");
+
+    // not known..
+    if (!rideDB.exists()) {
+        response.setStatus(404);
+        response.write("malformed URL or unknown athlete.\n");
+        return;
+    }
+
+    // intervals or rides?
+    QString intervalsp = request.getParameter("intervals");
+    if (intervalsp.toUpper() == "TRUE") settings.intervals = true;
+    else settings.intervals = false;
+
+    // set user data
+    response.setUserData(&settings);
 
     // write headings
     const RideMetricFactory &factory = RideMetricFactory::instance();
@@ -489,79 +512,188 @@ APIWebService::listRides(QString athlete, HttpRequest &request, HttpResponse &re
     QString metrics(request.getParameter("metrics"));
 
     // do all ?
+    bool nometrics = false;
     QStringList wantedNames;
-    QList<int> wanted;
     if (metrics != "") wantedNames = metrics.split(",");
 
     // write headings
     response.bwrite("date, time, filename");
 
-    int i=0;
-    foreach(const RideMetric *m, indexed) {
+    // don't want metrics, so do it fast by traversing the ride directory
+    if (wantedNames.count() == 1 && wantedNames[0].toUpper() == "NONE") nometrics = true;
 
-        i++;
+    // if intervals, add interval name
+    if (settings.intervals == true) response.bwrite(", interval name, interval type");
 
-        // if limited don't do limited headings
-        QString underscored = m->name().replace(" ","_");
-        if (wantedNames.count() && !wantedNames.contains(underscored)) continue;
+    // get metadata definitions into settings
+    QString metadata = request.getParameter("metadata");
+    bool nometa = true;
+    if (metadata.toUpper() != "NONE" && metadata != "") {
 
-        if (m->name().startsWith("BikeScore"))
-            response.bwrite(", BikeScore");
-        else {
-            response.bwrite(", ");
-            response.bwrite(underscored.toLocal8Bit());
+        // first lets read in meta config
+        QDir config(home.absolutePath() + "/" + athlete + "/config");
+        QString metaConfig = config.canonicalPath()+"/metadata.xml";
+        if (QFile(metaConfig).exists()) {
+
+            // params to readXML - we ignore them
+            QList<KeywordDefinition> keywordDefinitions;
+            QString colorfield;
+            QList<DefaultDefinition> defaultDefinitions;
+
+            RideMetadata::readXML(metaConfig, keywordDefinitions, settings.metafields, colorfield, defaultDefinitions);
         }
 
-        // index of wanted metrics
-        wanted << (i-1);
+        SpecialFields sp;
+
+        // what is being asked for ?
+        if (metadata.toUpper() == "ALL") {
+
+            // output all metadata
+            foreach(FieldDefinition field, settings.metafields) {
+                // don't do metric overrides !
+                if(!sp.isMetric(field.name)) settings.metawanted << field.name;
+            }
+
+        } else {
+
+            // selected fields - check they exist !
+            QStringList meta = metadata.split(",");
+            foreach(QString field, meta) {
+
+                // don't do metric overrides !
+                if(sp.isMetric(field)) continue;
+
+                // does it exist ?
+                QString lookup = field;
+                lookup.replace("_", " ");
+                foreach(FieldDefinition field, settings.metafields) {
+                    if (field.name == lookup) settings.metawanted << field.name;
+                }
+            }
+        }
+
+        // we found some?
+        if(settings.metawanted.count()) nometa = false;
     }
-    response.bwrite("\n");
 
-    // parse the rideDB and write a line for each entry
-    QString ridedb = QString("%1/%2/cache/rideDB.json").arg(home.absolutePath()).arg(athlete);
-    QFile rideDB(ridedb);
-    if (rideDB.exists() && rideDB.open(QFile::ReadOnly)) {
+    // list 'em by reading the ride cache from disk
+    if ((nometa == false || nometrics == false) && settings.intervals == false) {
 
-        // ok, lets read it in
-        QTextStream stream(&rideDB);
-        stream.setCodec("UTF-8");
+        int i=0;
+        foreach(const RideMetric *m, indexed) {
 
-        // Read the entire file into a QString -- we avoid using fopen since it
-        // doesn't handle foreign characters well. Instead we use QFile and parse
-        // from a QString
-        QString contents = stream.readAll();
-        rideDB.close();
+            i++;
 
-        // create scanner context for reentrant parsing
-        RideDBContext *jc = new RideDBContext;
-        jc->cache = NULL;
-        jc->api = this;
-        jc->response = &response;
-        jc->request = &request;
-        jc->wanted = wanted;
-        jc->old = false;
+            // if limited don't do limited headings
+            QString underscored = m->name().replace(" ","_");
+            if (wantedNames.count() && !wantedNames.contains(underscored)) continue;
 
-        // clean item
-        jc->item.path = home.absolutePath() + "/activities";
-        jc->item.context = NULL;
-        jc->item.isstale = jc->item.isdirty = jc->item.isedit = false;
+            if (m->name().startsWith("BikeScore"))
+                response.bwrite(", BikeScore");
+            else {
+                response.bwrite(", ");
+                response.bwrite(underscored.toLocal8Bit());
+            }
 
-        RideDBlex_init(&scanner);
+            // index of wanted metrics
+            settings.wanted << (i-1);
+        }
 
-        // inform the parser/lexer we have a new file
-        RideDB_setString(contents, scanner);
+        // do we want metadata too ?
+        foreach(QString meta, settings.metawanted) {
+            meta.replace(" ", "_");
+            response.bwrite(", \"");
+            response.bwrite(meta.toLocal8Bit());
+            response.bwrite("\"");
+        }
+        response.bwrite("\n");
 
-        // setup
-        jc->errors.clear();
+        // parse the rideDB and write a line for each entry
+        if (rideDB.exists() && rideDB.open(QFile::ReadOnly)) {
 
-        // parse it
-        RideDBparse(jc);
+            // ok, lets read it in
+            QTextStream stream(&rideDB);
+            stream.setCodec("UTF-8");
 
-        // clean up
-        RideDBlex_destroy(scanner);
+            // Read the entire file into a QString -- we avoid using fopen since it
+            // doesn't handle foreign characters well. Instead we use QFile and parse
+            // from a QString
+            QString contents = stream.readAll();
+            rideDB.close();
 
-        // regardless of errors we're done !
-        delete jc;
+            // create scanner context for reentrant parsing
+            RideDBContext *jc = new RideDBContext;
+            jc->cache = NULL;
+            jc->api = this;
+            jc->response = &response;
+            jc->request = &request;
+            jc->old = false;
+
+            // clean item
+            jc->item.path = home.absolutePath() + "/activities";
+            jc->item.context = NULL;
+            jc->item.isstale = jc->item.isdirty = jc->item.isedit = false;
+
+            RideDBlex_init(&scanner);
+
+            // inform the parser/lexer we have a new file
+            RideDB_setString(contents, scanner);
+
+            // setup
+            jc->errors.clear();
+
+            // parse it
+            RideDBparse(jc);
+
+            // clean up
+            RideDBlex_destroy(scanner);
+
+            // regardless of errors we're done !
+            delete jc;
+        }
+
+    } else {
+
+        // honour the since parameter
+        QString sincep(request.getParameter("since"));
+        QDate since(1900,01,01);
+        if (sincep != "") since = QDate::fromString(sincep,"yyyy/MM/dd");
+
+        // before parameter
+        QString beforep(request.getParameter("before"));
+        QDate before(3000,01,01);
+        if (beforep != "") before = QDate::fromString(beforep,"yyyy/MM/dd");
+
+        // fast list of rides by traversing the directory
+        response.bwrite("\n"); // headings have no metric columns
+
+        // This will read the user preferences and change the file list order as necessary:
+        QFlags<QDir::Filter> spec = QDir::Files;
+        QStringList names;
+        names << "*"; // anything
+
+        // loop through files, make sure in time range wanted
+        QDir activities(home.absolutePath() + "/" + athlete + "/activities");
+        foreach(QString name, activities.entryList(names, spec, QDir::Name)) {
+
+            // parse it into date and time
+            QDateTime dateTime;
+            if (!RideFile::parseRideFileName(name, &dateTime)) continue; 
+
+            // in range?
+            if (dateTime.date() < since || dateTime.date() > before) continue;
+
+            // is it a backup ?
+            if (name.endsWith(".bak")) continue;
+
+            // out a line
+            response.bwrite(dateTime.date().toString("yyyy/MM/dd").toLocal8Bit());
+            response.bwrite(", ");
+            response.bwrite(dateTime.time().toString("hh:mm:ss").toLocal8Bit());;
+            response.bwrite(", ");
+            response.bwrite(name.toLocal8Bit());
+            response.bwrite("\n");
+        }
     }
     response.flush();
 }

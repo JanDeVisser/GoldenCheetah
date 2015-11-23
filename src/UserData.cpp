@@ -20,6 +20,7 @@
 
 #include "RideNavigator.h"
 #include "Tab.h"
+#include "HelpWhatsThis.h"
 
 #include <QTextEdit> // for parsing trademark symbols (!)
 
@@ -65,8 +66,8 @@ EditUserDataDialog::EditUserDataDialog(Context *context, UserData *here) :
     setWindowTitle(tr("User Data Series"));
 
     //XXX return to this later
-    //HelpWhatsThis *help = new HelpWhatsThis(this);
-    //this->setWhatsThis(help->getWhatsThisText(HelpWhatsThis::ChartTrends_MetricTrends_Curves_Settings));
+    HelpWhatsThis *help = new HelpWhatsThis(this);
+    this->setWhatsThis(help->getWhatsThisText(HelpWhatsThis::ChartTrends_MetricTrends_User_Data));
 
     QVBoxLayout *mainLayout = new QVBoxLayout(this);
 
@@ -108,6 +109,7 @@ EditUserDataDialog::EditUserDataDialog(Context *context, UserData *here) :
     list += RideFile::symbols();
 
     // add special functions (older code needs fixing !)
+    list << "config(cranklength)";
     list << "config(cp)";
     list << "config(w')";
     list << "config(pmax)";

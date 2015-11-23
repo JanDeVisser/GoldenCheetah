@@ -18,6 +18,7 @@
 
 #include "FitRideFile.h"
 #include "Settings.h"
+#include "Units.h"
 #include <QSharedPointer>
 #include <QMap>
 #include <QSet>
@@ -28,8 +29,9 @@
 #include <stdint.h>
 #include <time.h>
 #include <limits>
-
+#include <cmath>
 #define FIT_DEBUG false // debug traces
+#define LAPSWIM_DEBUG false
 
 #define RECORD_TYPE 20
 
@@ -85,6 +87,8 @@ struct FitFileReaderState
     int calibration;
     int devices;
     bool stopped;
+    bool isLapSwim;
+    double pool_length;
     int last_event_type;
     int last_event;
     int last_msg_type;
@@ -94,7 +98,7 @@ struct FitFileReaderState
 
     FitFileReaderState(QFile &file, QStringList &errors) :
         file(file), errors(errors), rideFile(NULL), start_time(0),
-        last_time(0), last_distance(0.00f), interval(0), calibration(0), devices(0), stopped(true),
+        last_time(0), last_distance(0.00f), interval(0), calibration(0), devices(0), stopped(true), isLapSwim(false), pool_length(0.0),
         last_event_type(-1), last_event(-1), last_msg_type(-1)
     {
     }
@@ -257,24 +261,34 @@ struct FitFileReaderState
         }
         if (manu == 1) {
             // Garmin
+            // Product IDs can be found in c/fit_example.h in the FIT SDK.
+            // Multiple product IDs refer to different regions e.g. China, Japan etc.
             switch (prod) {
-                case 717: rideFile->setDeviceType("Garmin FR405"); break;
+                case 473: case 474: case 475: case 494: rideFile->setDeviceType("Garmin FR301"); break;
+                case 717: case 987: rideFile->setDeviceType("Garmin FR405"); break;
                 case 782: rideFile->setDeviceType("Garmin FR50"); break;
                 case 988: rideFile->setDeviceType("Garmin FR60"); break;
                 case 1018: rideFile->setDeviceType("Garmin FR310XT"); break;
-                case 1036: rideFile->setDeviceType("Garmin Edge 500"); break;
-                case 1124: rideFile->setDeviceType("Garmin FR110"); break;
-                case 1169: rideFile->setDeviceType("Garmin Edge 800"); break;
+                case 1036: case 1199: case 1213: case 1387: rideFile->setDeviceType("Garmin Edge 500"); break;
+                case 1124: case 1274: rideFile->setDeviceType("Garmin FR110"); break;
+                case 1169: case 1333: case 1334: case 1386: rideFile->setDeviceType("Garmin Edge 800"); break;
                 case 1325: rideFile->setDeviceType("Garmin Edge 200"); break;
                 case 1328: rideFile->setDeviceType("Garmin FR910XT"); break;
-                case 1561: rideFile->setDeviceType("Garmin Edge 510"); break;
+                case 1345: case 1410: rideFile->setDeviceType("Garmin FR610"); break;
+                case 1360: rideFile->setDeviceType("Garmin FR210"); break;
+                case 1436: rideFile->setDeviceType("Garmin FR70"); break;
+                case 1446: rideFile->setDeviceType("Garmin FR310XT 4T"); break;
+                case 1482: case 1688: rideFile->setDeviceType("Garmin FR10"); break;
+                case 1499: rideFile->setDeviceType("Garmin Swim"); break;
+                case 1551: rideFile->setDeviceType("Garmin Fenix"); break;
+                case 1561: case 1742: case 1821: rideFile->setDeviceType("Garmin Edge 510"); break;
                 case 1567: rideFile->setDeviceType("Garmin Edge 810"); break;
                 case 1623: rideFile->setDeviceType("Garmin FR620"); break;
-                case 1765: rideFile->setDeviceType("Garmin FR920XT"); break;
-                case 1836: rideFile->setDeviceType("Garmin Edge 1000"); break;
+                case 1765: case 2130: case 2131: case 2132: rideFile->setDeviceType("Garmin FR920XT"); break;
+                case 1836: case 2052: case 2053: case 2070: case 2100: rideFile->setDeviceType("Garmin Edge 1000"); break;
                 case 1903: rideFile->setDeviceType("Garmin FR15"); break;
                 case 1967: rideFile->setDeviceType("Garmin Fenix2"); break;
-                case 2050: rideFile->setDeviceType("Garmin Fenix3"); break;
+                case 2050: case 2188: case 2189: rideFile->setDeviceType("Garmin Fenix3"); break;
                 case 2067: rideFile->setDeviceType("Garmin Edge 520"); break;
                 case 2147: rideFile->setDeviceType("Garmin Edge 25"); break;
                 case 2153: rideFile->setDeviceType("Garmin FR225"); break;
@@ -343,6 +357,9 @@ struct FitFileReaderState
                             rideFile->setTag("Sport","Run");
                             break;
                         default: // if we can't work it out, assume bike
+                            // but only if not already set to another sport,
+                            // Garmin Swim send 2 tags for example
+                            if (rideFile->getTag("Sport", "Bike") != "Bike") break;
                         case 2: // cycling
                             rideFile->setTag("Sport","Bike");
                             break;
@@ -350,6 +367,9 @@ struct FitFileReaderState
                             rideFile->setTag("Sport","Swim");
                             break;
                     }
+                    break;
+                case 44: // pool_length
+                    pool_length = value/100000;
                     break;
                 default: ; // do nothing
             }
@@ -456,6 +476,8 @@ struct FitFileReaderState
         int i = 0;
         time_t this_start_time = 0;
         ++interval;
+        double total_elapsed_time = 0.0;
+        double total_distance = 0.0;
         foreach(const FitField &field, def.fields) {
             fit_value_t value = values[i++].v;
 
@@ -465,9 +487,12 @@ struct FitFileReaderState
             switch (field.num) {
                 case 253: time = value + qbase_time.toTime_t(); break;
                 case 2: this_start_time = value + qbase_time.toTime_t(); break;
+                case 7: total_elapsed_time = round(value / 1000.0); break;
+                case 9: total_distance = value / 100000.0; break;
                 default: ; // ignore it
             }
         }
+        if (LAPSWIM_DEBUG) qDebug() << "Lap" << interval << this_start_time - start_time << total_elapsed_time << time - this_start_time << total_distance;
         if (this_start_time == 0 || this_start_time-start_time < 0) {
             //errors << QString("lap %1 has invalid start time").arg(interval);
             this_start_time = start_time; // time was corrected after lap start
@@ -477,12 +502,17 @@ struct FitFileReaderState
                 return;
             }
         }
-
-        if (rideFile->dataPoints().count()) // no samples means no laps..
-            rideFile->addInterval(RideFileInterval::DEVICE, this_start_time - start_time, time - start_time, QString(QObject::tr("Lap %1")).arg(interval));
+        if (rideFile->dataPoints().count()) { // no samples means no laps..
+            if (isLapSwim && total_elapsed_time > 0.0) {
+                rideFile->addInterval(RideFileInterval::DEVICE, this_start_time - start_time, this_start_time - start_time + total_elapsed_time, QObject::tr("Lap %1").arg(interval));
+            } else {
+                rideFile->addInterval(RideFileInterval::DEVICE, this_start_time - start_time, time - start_time, QString(QObject::tr("Lap %1")).arg(interval));
+            }
+        }
     }
 
     void decodeRecord(const FitDefinition &def, int time_offset, const std::vector<FitValue> values) {
+        if (isLapSwim) return; // We use the length message for Lap Swimming
         time_t time = 0;
         if (time_offset > 0)
             time = last_time + time_offset;
@@ -673,7 +703,6 @@ struct FitFileReaderState
         //    time, lat, lng, alt, hr,
         //    cad, km, kph, watts, grade,
         //    resistance, time_from_course, temperature );
-
         double secs = time - start_time;
         double nm = 0;
         double headwind = 0.0;
@@ -777,9 +806,164 @@ struct FitFileReaderState
                      leftTopDeathCenter, rightTopDeathCenter, leftBottomDeathCenter, rightBottomDeathCenter,
                      leftTopPeakPowerPhase, rightTopPeakPowerPhase, leftBottomPeakPowerPhase, rightBottomPeakPowerPhase,
                      smO2, tHb, rvert, rcad, rcontact, 0.0, interval);
-
         last_time = time;
         last_distance = km;
+    }
+
+    void decodeLength(const FitDefinition &def, int time_offset, const std::vector<FitValue> values) {
+        if (!isLapSwim) {
+            isLapSwim = true;
+            // reset rideFile if not empty
+            if (!rideFile->dataPoints().empty()) {
+                start_time = 0;
+                last_time = 0;
+                last_distance = 0.00f;
+                interval = 0;
+                delete rideFile;
+                rideFile = new RideFile;
+                rideFile->setDeviceType("Garmin FIT");
+                rideFile->setRecIntSecs(1.0);
+             }
+        }
+        time_t time = 0;
+        if (time_offset > 0)
+            time = last_time + time_offset;
+        double cad = 0, km = 0, kph = 0;
+
+        bool length_type = false;
+        double length_duration = 0.0;
+
+        int i = 0;
+        foreach(const FitField &field, def.fields) {
+            fit_value_t value = values[i++].v;
+
+            if( value == NA_VALUE )
+                continue;
+
+            switch (field.num) {
+                case 0: // event
+                        if (FIT_DEBUG) qDebug() << " event:" << value;
+                        break;
+                case 1: // event type
+                        if (FIT_DEBUG) qDebug() << " event_type:" << value;
+                        break;
+                case 2: // start time
+                        time = value + qbase_time.toTime_t();
+                        // Time MUST NOT go backwards
+                        // You canny break the laws of physics, Jim
+                        if (time < last_time)
+                            time = last_time;
+                        break;
+                case 3: // total elapsed time
+                        length_duration = value / 1000;
+                        break;
+                case 4: // total timer time
+                        if (FIT_DEBUG) qDebug() << " total_timer_time:" << value;
+                        break;
+                case 5: // total strokes
+                        if (FIT_DEBUG) qDebug() << " total_strokes:" << value;
+                        break;
+                case 6: // avg speed
+                        kph = value * 3.6 / 1000.0;
+                        break;
+                case 7: // swim stroke
+                        if (FIT_DEBUG) qDebug() << " swim_stroke:" << value;
+                        break;
+                case 9: // cadence
+                        cad = value;
+                        break;
+                case 11: // total_calories
+                        if (FIT_DEBUG) qDebug() << " total_calories:" << value;
+                        break;
+                case 12: // length type: 0-rest, 1-strokes
+                        length_type = value;
+                        break;
+                case 254: // message_index
+                        if (FIT_DEBUG) qDebug() << " message_index:" << value;
+                        break;
+                default:
+                         unknown_record_fields.insert(field.num);
+            }
+        }
+
+        // Rest interval
+        if (!length_type) {
+            kph = 0.0;
+            cad = 0.0;
+        }
+        if (time == last_time)
+            return; // Sketchy, but some FIT files do this.
+        if (start_time == 0) {
+            start_time = time - 1; // recording interval?
+            QDateTime t;
+            t.setTime_t(start_time);
+            rideFile->setStartTime(t);
+        }
+
+        double secs = time - start_time;
+
+        // Normalize distance for the most common pool lengths,
+        // this is a hack to avoid the need for a double pass when
+        // pool_length comes in Session message at the end of the file.
+        if (pool_length == 0.0) {
+            pool_length = kph*length_duration/3600;
+            if (fabs(pool_length - 0.050) < 0.004) pool_length = 0.050;
+            else if (fabs(pool_length - 0.033) < 0.003) pool_length = 0.033;
+            else if (fabs(pool_length - 0.025) < 0.002) pool_length = 0.025;
+            else if (fabs(pool_length - 0.025*METERS_PER_YARD) < 0.002) pool_length = 0.025*METERS_PER_YARD;
+            else if (fabs(pool_length - 0.020) < 0.002) pool_length = 0.020;
+        }
+
+        // another pool length or pause
+        km = last_distance + (kph > 0.0 ? pool_length : 0.0);
+
+        if ((secs > last_time + 1) && (isGarminSmartRecording.toInt() != 0) && (secs - last_time < 10*GarminHWM.toInt())) {
+            double deltaSecs = secs - last_time;
+            if (LAPSWIM_DEBUG) qDebug() << "Pause" << last_time+1 << deltaSecs;
+            for (int i = 1; i <= deltaSecs; i++) {
+                rideFile->appendPoint(
+                    last_time+i, 0.0, 0.0,
+                    last_distance,
+                    0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+                    0.0, 0.0, RideFile::NoTemp,
+                    0.0, 0.0, 0.0,
+                    0.0, 0.0,
+                    0.0, 0.0,
+                    0.0, 0.0,
+                    0.0, 0.0,
+                    0.0, 0.0,
+                    0.0, 0.0,
+                    0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0);
+            }
+            last_time += deltaSecs;
+        }
+
+        // only fill 10x the maximal smart recording gap defined
+        // in preferences - we don't want to crash / stall on bad
+        // or corrupt files
+        if ((isGarminSmartRecording.toInt() != 0) && length_duration > 0 && length_duration < 10*GarminHWM.toInt()) {
+            double deltaSecs = length_duration;
+            double deltaDist = km - last_distance;
+            kph = 3600.0 * deltaDist / deltaSecs;
+            if (LAPSWIM_DEBUG) qDebug() << "Length" << last_time+1 << deltaSecs << deltaDist;
+            for (int i = 1; i <= deltaSecs; i++) {
+                rideFile->appendPoint(
+                    last_time + i, cad, 0.0,
+                    last_distance + (deltaDist * i/deltaSecs),
+                    kph, 0.0, 0.0, 0.0, 0.0, 0.0,
+                    0.0, 0.0, RideFile::NoTemp,
+                    0.0, 0.0, 0.0,
+                    0.0, 0.0,
+                    0.0, 0.0,
+                    0.0, 0.0,
+                    0.0, 0.0,
+                    0.0, 0.0,
+                    0.0, 0.0,
+                    0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0);
+            }
+            last_time += deltaSecs;
+            last_distance += deltaDist;
+        }
     }
 
     int read_record(bool &stop, QStringList &errors) {
@@ -925,16 +1109,14 @@ struct FitFileReaderState
                 case 23: //decodeDeviceInfo(def, time_offset, values); break; /* device info */
                 case 18: decodeSession(def, time_offset, values); break; /* session */
 
-                case 101: /* lap swimming length */
-                    errors << "Unsupported Lap Swimming FIT File - Use .tcx or .pwx formats";
-                    stop = true;
-                    break;
+                case 101: decodeLength(def, time_offset, values); break; /* lap swimming */
 
                 case 2: /* DEVICE_SETTINGS */
                 case 3: /* USER_PROFILE */
                 case 7: /* ZONES_TARGET12 */
                 case 8: /* HR_ZONE */
                 case 9: /* POWER_ZONE */
+                case 12: /* SPORT */
                 case 13: /* unknown */
                 case 22: /* undocumented */
                 case 72: /* undocumented  - new for garmin 800*/
@@ -945,6 +1127,8 @@ struct FitFileReaderState
                 case 113: /* unknown */
                 case 125: /* unknown */
                 case 128: /* unknown */
+                case 140: /* unknown */
+                case 141: /* unknown */
                 case 147: /* unknown */
 
                     break;

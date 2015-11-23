@@ -16,22 +16,24 @@
  * Franklin Street, Fifth Floor, Boston, MA  02110-1301  USA
  */
 
+#include "Context.h"
+#include "Athlete.h"
+#include "MainWindow.h"
+#include "Settings.h"
+#include "TrainDB.h"
+#include "Colors.h"
+#include "GcUpgrade.h"
+
 #include <QApplication>
 #include <QtGui>
 #include <QFile>
 #include <QWebSettings>
 #include <QMessageBox>
 #include "ChooseCyclistDialog.h"
-#include "MainWindow.h"
-#include "Settings.h"
-#include "TrainDB.h"
-#include "Colors.h"
 #ifdef GC_WANT_HTTP
 #include "httplistener.h"
 #include "httprequesthandler.h"
 #endif
-
-#include "GcUpgrade.h"
 
 #include <signal.h>
 
@@ -72,8 +74,34 @@ QString gcroot;
 
 QApplication *application;
 
+bool nogui;
 #ifdef GC_WANT_HTTP
 #include "APIWebService.h"
+#if QT_VERSION > 0x50000
+void myMessageOutput(QtMsgType type, const QMessageLogContext &, const QString &string)
+ {
+    const char *msg = string.toLocal8Bit().constData();
+#else
+void myMessageOutput(QtMsgType type, const char *msg)
+ {
+#endif
+     //in this function, you can write the message to any stream!
+     switch (type) {
+     case QtDebugMsg:
+         fprintf(stderr, "Debug: %s\n", msg);
+         break;
+     case QtWarningMsg: // supress warnings unless server mode
+         if (nogui) fprintf(stderr, "Warning: %s\n", msg);
+         break;
+     case QtCriticalMsg:
+         fprintf(stderr, "Critical: %s\n", msg);
+         break;
+     case QtFatalMsg:
+         fprintf(stderr, "Fatal: %s\n", msg);
+         abort();
+     }
+ }
+
 HttpListener *listener;
 void sigabort(int)
 {
@@ -102,6 +130,7 @@ main(int argc, char *argv[])
     bool debug = false;
 #endif
     bool server = false;
+    nogui = false;
     bool help = false;
 
     // honour command line switches
@@ -126,7 +155,7 @@ main(int argc, char *argv[])
 
         } else if (arg == "--server") {
 #ifdef GC_WANT_HTTP
-                server = true;
+                nogui = server = true;
 #else
                 fprintf(stderr, "HTTP support not compiled in, exiting.\n");
                 exit(1);
@@ -156,6 +185,9 @@ main(int argc, char *argv[])
     //
     // INITIALISE ONE TIME OBJECTS
     //
+#ifdef GC_WANT_HTTP
+    listener = NULL;
+#endif
 
 #ifdef Q_OS_X11
     XInitThreads();
@@ -178,15 +210,17 @@ main(int argc, char *argv[])
     static CocoaInitializer cocoaInitializer;
 #endif
 
+    // set default colors
+    GCColor::setupColors();
+    appsettings->migrateQSettingsSystem(); // colors must be setup before migration can take place, but reading has to be from the migrated ones
+    GCColor::readConfig();
+
     // set defaultfont
     QFont font;
     font.fromString(appsettings->value(NULL, GC_FONT_DEFAULT, QFont().toString()).toString());
     font.setPointSize(appsettings->value(NULL, GC_FONT_DEFAULT_SIZE, 10).toInt());
     application->setFont(font); // set default font
 
-    // set default colors
-    GCColor::setupColors();
-    GCColor::readConfig();
 
     //
     // OPEN FIRST MAINWINDOW
@@ -252,10 +286,14 @@ main(int argc, char *argv[])
 
         // set global root directory
         gcroot = home.canonicalPath();
+        appsettings->initializeQSettingsGlobal(gcroot);
+
 
         // now redirect stderr
 #ifndef WIN32
         if (!debug) nostderr(home.canonicalPath());
+#else
+        Q_UNUSED(debug)
 #endif
 
         // install QT Translator to enable QT Dialogs translation
@@ -304,9 +342,16 @@ main(int argc, char *argv[])
             // no parameters passed lets open the last athlete we worked with
             lastOpened = appsettings->value(NULL, GC_SETTINGS_LAST);
 
-            // but hang on, did they crash? if so we need to open with a menu
-            if(appsettings->cvalue(lastOpened.toString(), GC_SAFEEXIT, true).toBool() != true)
+            // does lastopened Directory exists at all
+            QDir lastOpenedDir(gcroot+"/"+lastOpened.toString());
+            if (lastOpenedDir.exists()) {
+                // but hang on, did they crash? if so we need to open with a menu
+                appsettings->initializeQSettingsAthlete(gcroot, lastOpened.toString());
+                if(appsettings->cvalue(lastOpened.toString(), GC_SAFEEXIT, true).toBool() != true)
+                    lastOpened = QVariant();
+            } else {
                 lastOpened = QVariant();
+            }
             
         }
 
@@ -314,11 +359,22 @@ main(int argc, char *argv[])
 
         // The API server offers webservices (default port 12021, see httpserver.ini)
         // This is to enable integration with R and similar
-        if (server) {
+        if (appsettings->value(NULL, GC_START_HTTP, true).toBool() || server) {
 
-            // does the ini file exist ?
-            qDebug()<<"Starting GoldenCheetah API web-services... (hit ^C to close)";
-            qDebug()<<"Athlete directory:"<<home.absolutePath();
+            // notifications etc
+            if (nogui) {
+                qDebug()<<"Starting GoldenCheetah API web-services... (hit ^C to close)";
+                qDebug()<<"Athlete directory:"<<home.absolutePath();
+            } else {
+                // switch off warnings if in gui mode
+#ifndef GC_WANT_ALLDEBUG
+#if QT_VERSION > 0x50000
+                qInstallMessageHandler(myMessageOutput);
+#else
+                qInstallMsgHandler(myMessageOutput);
+#endif
+#endif
+            }
 
             QString httpini = home.absolutePath() + "/httpserver.ini";
             if (!QFile(httpini).exists()) {
@@ -344,19 +400,28 @@ main(int argc, char *argv[])
 
             // use the default handler (just get an error page)
             QSettings* settings=new QSettings(httpini,QSettings::IniFormat,application);
+
+            if (listener) {
+                // when changing the Athlete Directory, there is already a listener running
+                // close first to avoid errors
+                listener->close();
+            }
             listener=new HttpListener(settings,new APIWebService(home, application),application);
 
-            // catch ^C exit
-            signal(SIGINT, sigabort);
+            // if not going on to launch a gui...
+            if (nogui) {
+                // catch ^C exit
+                signal(SIGINT, sigabort);
 
-            ret = application->exec();
+                ret = application->exec();
 
-            // stop web server if running
-            qDebug()<<"Stopping GoldenCheetah API web-services...";
-            listener->close();
+                // stop web server if running
+                qDebug()<<"Stopping GoldenCheetah API web-services...";
+                listener->close();
 
-            // and done
-            exit(0);
+                // and done
+                exit(0);
+            }
         }
 #endif
 
@@ -367,7 +432,9 @@ main(int argc, char *argv[])
             QStringListIterator i(list);
             while (i.hasNext()) {
                 QString cyclist = i.next();
+                QString homeDir = home.canonicalPath();
                 if (home.cd(cyclist)) {
+                    appsettings->initializeQSettingsAthlete(homeDir, cyclist);
                     GcUpgrade v3;
                     if (v3.upgradeConfirmedByUser(home)) {
                         MainWindow *mainWindow = new MainWindow(home);
@@ -397,12 +464,14 @@ main(int argc, char *argv[])
             }
 
             // chosen, so lets get the choice..
+            QString homeDir = home.canonicalPath();
             home.cd(d.choice());
             if (!home.exists()) {
                 delete trainDB;
                 exit(0);
             }
 
+            appsettings->initializeQSettingsAthlete(homeDir, d.choice());
             // .. and open a mainwindow
             GcUpgrade v3;
             if (v3.upgradeConfirmedByUser(home)) {
@@ -419,6 +488,9 @@ main(int argc, char *argv[])
 
         // close trainDB
         delete trainDB;
+
+        // reset QSettings (global & Athlete)
+        appsettings->clearGlobalAndAthletes();
 
         // clear web caches (stop warning of WebKit leaks)
         QWebSettings::clearMemoryCaches();

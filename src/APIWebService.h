@@ -21,7 +21,15 @@
 
 #include "httprequesthandler.h"
 #include "RideItem.h"
+#include "RideMetadata.h"
 #include <QDir>
+
+struct listRideSettings {
+    bool intervals;
+    QList<int> wanted; // metrics to list
+    QList<FieldDefinition> metafields;
+    QList<QString> metawanted; // metadata to list
+};
 
 class APIWebService : public HttpRequestHandler
 {
@@ -40,9 +48,10 @@ class APIWebService : public HttpRequestHandler
         void listRides(QString athlete, HttpRequest &request, HttpResponse &response);
         void listActivity(QString athlete, QStringList paths, HttpRequest &request, HttpResponse &response);
         void listMMP(QString athlete, QStringList paths, HttpRequest &request, HttpResponse &response);
+        void listZones(QString athlete, QStringList paths, HttpRequest &request, HttpResponse &response);
 
         // utility
-        void writeRideLine(QList<int> wanted, RideItem &item, HttpRequest *request, HttpResponse *response);
+        void writeRideLine(RideItem &item, HttpRequest *request, HttpResponse *response);
 
     private:
         QDir home;

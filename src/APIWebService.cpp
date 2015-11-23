@@ -23,9 +23,15 @@
 #include "RideDB.h"
 
 #include "RideFile.h"
+#include "RideFileCache.h"
 #include "CsvRideFile.h"
 
+#include "Zones.h"
+#include "HrZones.h"
+#include "PaceZones.h"
+
 #include <QTemporaryFile>
+#include <QFile>
 
 void
 APIWebService::service(HttpRequest &request, HttpResponse &response)
@@ -34,23 +40,19 @@ APIWebService::service(HttpRequest &request, HttpResponse &response)
     QString fullPath = request.getPath();
     while (fullPath.endsWith("/")) fullPath.chop(1);
 
-    // get the paths
+    // get the paths, strip empty stuff
     QStringList paths = QString(request.getPath()).split("/");
+    while (paths.count() && paths[paths.count()-1] == "") paths.removeLast();
+    while (paths.count() && paths[0] == "") paths.removeFirst();
 
-    // we need to look at the first path to determine action
-    if (paths.count() < 2) return; // impossible really
-
-    // get ride of first blank, all URLs start with a '/'
-    paths.removeFirst();
+    // we don't have a fave icon
+    if (paths.count() && paths[0] == "favicon.ico") return;
 
     // ROOT PATH RETURNS A LIST OF ATHLETES
-    if (paths[0] == "") {
+    if (paths.count() == 0) {
         listAthletes(request, response); // return csv list of all athlete and their characteristics
         return;
     }
-
-    // we don't have a fave icon
-    if (paths[0] == "favicon.ico") return;
 
     // Call to retreive athlete data, downstream will resolve
     // which functions to call for different data requests
@@ -61,11 +63,40 @@ void
 APIWebService::athleteData(QStringList &paths, HttpRequest &request, HttpResponse &response)
 {
 
-    // LIST ACTIVITIES FOR ATHLETE
-    if (paths.count() == 2) {
+    // check we have an athlete and it is valid
+    if (paths.count() == 0) {
 
+        response.setStatus(404); // malformed URL
+        response.setHeader("Content-Type", "text; charset=ISO-8859-1");
+        response.write("missing athlete.");
+        return;
+    } else {
+        QFile ridedb(home.absolutePath() + "/" + paths[0] + "/cache/rideDB.json");
+        if (!ridedb.exists()) {
+            response.setStatus(404); // malformed URL
+            response.setHeader("Content-Type", "text; charset=ISO-8859-1");
+            response.write("unknown athlete " + paths[0].toLocal8Bit());
+            return;
+        }
+    }
+    if (paths.count() == 1) {
+
+        // LIST ACTIVITIES FOR ATHLETE
+        // http://localhost:12021/athlete
         listRides(paths[0], request, response);
         return;
+
+    } else if (paths.count() == 2) {
+
+        QString athlete = paths[0];
+        paths.removeFirst();
+
+        // GET ZONES
+        // http://localhost:12021/athlete/zones
+        if (paths[0] == "zones") {
+            listZones(athlete, paths, request, response);
+            return;
+        }
 
     } else if (paths.count() == 3) {
 
@@ -73,19 +104,34 @@ APIWebService::athleteData(QStringList &paths, HttpRequest &request, HttpRespons
         paths.removeFirst();
 
         // GET ACTIVITY
+        // http://localhost:12021/athlete/activity/filename
+        // optional query parameters:
+        //      ?format=json    (default)
+        //      ?format=<xx>    xx = one of (csv, tcx, pwx)
         if (paths[0] == "activity") {
+
             paths.removeFirst();
             listActivity(athlete, paths, request, response);
             return;
         }
 
         // GET MMP
-        if (paths[0] == "mmp") {
+        if (paths[0] == "meanmax") {
+
+            // http://localhost:12021/athlete/meanmax/filename
+            // optional query parameter:
+            //    ?series=watts     (default)
+            //    ?series=<xx>  xx= one of (cad, speed, vam, NP, xPower, nm)
+            // http://localhost:12021/athlete/meanmax/bests
+            // optional query parameter:
+            //    ?series=watts     (default)
+            //    ?series=<xx>  xx=1 of (cad, speed, vam, NP, xPower, nm)
             paths.removeFirst();
             listMMP(athlete, paths, request, response);
             return;
         }
-    }
+
+     }
 
     // GET HERE ITS BAD!
     response.setStatus(404); // malformed URL
@@ -94,7 +140,7 @@ APIWebService::athleteData(QStringList &paths, HttpRequest &request, HttpRespons
 }
 
 void
-APIWebService::listAthletes(HttpRequest &request, HttpResponse &response)
+APIWebService::listAthletes(HttpRequest &, HttpResponse &response)
 {
     response.setHeader("Content-Type", "text; charset=ISO-8859-1");
 
@@ -126,7 +172,7 @@ APIWebService::listAthletes(HttpRequest &request, HttpResponse &response)
 
 
 void 
-APIWebService::writeRideLine(QList<int> wanted, RideItem &item, HttpRequest *request, HttpResponse *response)
+APIWebService::writeRideLine(RideItem &item, HttpRequest *request, HttpResponse *response)
 {
 
     // honour the since parameter
@@ -143,29 +189,86 @@ APIWebService::writeRideLine(QList<int> wanted, RideItem &item, HttpRequest *req
     if (item.dateTime.date() < since) return;
     if (item.dateTime.date() > before) return;
 
-    // date, time, filename
-    response->bwrite(item.dateTime.date().toString("yyyy/MM/dd").toLocal8Bit());
-    response->bwrite(",");
-    response->bwrite(item.dateTime.time().toString("hh:mm:ss").toLocal8Bit());;
-    response->bwrite(",");
-    response->bwrite(item.fileName.toLocal8Bit());
+    // are we doing rides or intervals?
+    listRideSettings *settings = static_cast<listRideSettings *>(response->userData());
 
-    if (wanted.count()) {
-        // specific metrics
-        foreach(int index, wanted) {
-            double value = item.metrics()[index];
-            response->bwrite(",");
-            response->bwrite(QString("%1").arg(value, 'f').simplified().toLocal8Bit());
+    if (settings->intervals == true) {
+
+        // loop through all available intervals for this ride item
+        foreach(IntervalItem *interval, item.intervals()){ 
+
+            // date, time, filename
+            response->bwrite(item.dateTime.date().toString("yyyy/MM/dd").toLocal8Bit());
+            response->bwrite(", ");
+            response->bwrite(item.dateTime.time().toString("hh:mm:ss").toLocal8Bit());;
+            response->bwrite(", ");
+            response->bwrite(item.fileName.toLocal8Bit());
+
+            // now the interval name and type
+            response->bwrite(", \"");
+            response->bwrite(interval->name.toLocal8Bit());
+            response->bwrite("\", ");
+            response->bwrite(QString("%1").arg(static_cast<int>(interval->type)).toLocal8Bit());
+
+            // essentially the same as below .. cut and paste (refactor?XXX)
+            if (settings->wanted.count()) {
+                // specific metrics
+                foreach(int index, settings->wanted) {
+                    double value = interval->metrics()[index];
+                    response->bwrite(",");
+                    response->bwrite(QString("%1").arg(value, 'f').simplified().toLocal8Bit());
+                }
+            } else {
+    
+                // all metrics...
+                foreach(double value, interval->metrics()) {
+                    response->bwrite(",");
+                    response->bwrite(QString("%1").arg(value, 'f').simplified().toLocal8Bit());
+                }
+            }
+            response->bwrite("\n");
         }
+
     } else {
 
-        // all metrics...
-        foreach(double value, item.metrics()) {
-            response->bwrite(",");
-            response->bwrite(QString("%1").arg(value, 'f').simplified().toLocal8Bit());
+        // date, time, filename
+        response->bwrite(item.dateTime.date().toString("yyyy/MM/dd").toLocal8Bit());
+        response->bwrite(",");
+        response->bwrite(item.dateTime.time().toString("hh:mm:ss").toLocal8Bit());;
+        response->bwrite(",");
+        response->bwrite(item.fileName.toLocal8Bit());
+
+        if (settings->wanted.count()) {
+            // specific metrics
+            foreach(int index, settings->wanted) {
+                double value = item.metrics()[index];
+                response->bwrite(",");
+                response->bwrite(QString("%1").arg(value, 'f').simplified().toLocal8Bit());
+            }
+        } else {
+    
+            // all metrics...
+            foreach(double value, item.metrics()) {
+                response->bwrite(",");
+                response->bwrite(QString("%1").arg(value, 'f').simplified().toLocal8Bit());
+            }
         }
+
+        // all the metadata asked for
+        foreach(QString name, settings->metawanted) {
+            QString text = item.getText(name,"");
+            text.replace("\"","'");   // don't use double quotes...
+            text.replace("\n","\\n"); // newlines
+            text.replace("\r","\\r"); // carriage returns
+            text.replace("\t","\\t"); // tabs
+
+            response->bwrite(",\"");
+            response->bwrite(text.toLocal8Bit());
+            response->bwrite("\"");
+        }
+
+        response->bwrite("\n");
     }
-    response->bwrite("\n");
 }
 
 void
@@ -200,101 +303,86 @@ APIWebService::listActivity(QString athlete, QStringList paths, HttpRequest &req
             }
         }
 
-        if (format == "") {
+        // default to json
+        if (format == "") format = "json";
 
-            // list activities and associated metrics
-            response.setHeader("Content-Type", "application/json; charset=ISO-8859-1");
+        // lets go with tcx/pwx as xml, full csv (not powertap) and GC json
+        QStringList formats;
+        formats << "tcx"; // garmin training centre
+        formats << "csv"; // full csv list (not powertap)
+        formats << "json"; // gc json
+        formats << "pwx"; // gc json
+
+        // unsupported format
+        if (!formats.contains(format)) {
+            response.setStatus(500);
+            response.write("unsupported format; we support:");
+            foreach(QString fmt, formats) {
+                response.write(" ");
+                response.write(fmt.toLocal8Bit());
+            }
+            response.write("\r\n");
+            return;
+        } else {
+
+            // set the content type appropriately
+            if (format == "tcx") response.setHeader("Content-Type", "application/vnd.garmin.tcx+xml; charset=ISO-8859-1");
+            if (format == "csv") response.setHeader("Content-Type", "text/csv; charset=ISO-8859-1");
+            if (format == "json") response.setHeader("Content-Type", "application/json; charset=ISO-8859-1");
+            if (format == "pwx") response.setHeader("Content-Type", "application/vnd.trainingpeaks.pwx+xml; charset=ISO-8859-1");
+        }
+
+        // lets read the file in as a ridefile
+        QStringList errors;
+        RideFile *f = RideFileFactory::instance().openRideFile(NULL, file, errors);
+
+        // error reading (!)
+        if (f == NULL) {
+            response.setStatus(500);
+            foreach(QString error, errors) {
+                response.write(error.toLocal8Bit());
+                response.write("\r\n");
+            }
+            return;
+        }
+
+        // write out to a temporary file in
+        // the format requested
+        bool success;
+        QTemporaryFile tempfile; // deletes file when goes out of scope
+        QString tempname;
+        if (tempfile.open()) tempname = tempfile.fileName();
+        else {
+            response.setStatus(500);
+            response.write("error opening temporary file");
+            return;
+        }
+        QFile out(tempname);
+
+        if (format == "csv") {
+            CsvFileReader writer;
+            success = writer.writeRideFile(NULL, f, out, CsvFileReader::gc);
+        } else {
+            success = RideFileFactory::instance().writeRideFile(NULL, f, out, format);
+        }
+
+        if (success) {
 
             // read in the whole thing
-            QTextStream in(&file);
-            // GC .JSON is stored in UTF-8 with BOM(Byte order mark) for identification
+            out.open(QFile::ReadOnly | QFile::Text);
+            QTextStream in(&out);
             in.setCodec ("UTF-8");
             contents = in.readAll();
-            file.close();
+            out.close();
 
             // write back in one hit
             response.write(contents.toLocal8Bit(), true);
+            return;
 
         } else {
-
-            // lets go with tcx/pwx as xml, full csv (not powertap) and GC json
-            QStringList formats;
-            formats << "tcx"; // garmin training centre
-            formats << "csv"; // full csv list (not powertap)
-            formats << "json"; // gc json
-            formats << "pwx"; // gc json
-
-            // unsupported format
-            if (!formats.contains(format)) {
-                response.setStatus(500);
-                response.write("unsupported format; we support:");
-                foreach(QString fmt, formats) {
-                    response.write(" ");
-                    response.write(fmt.toLocal8Bit());
-                }
-                response.write("\r\n");
-                return;
-            } else {
-
-                // set the content type appropriately
-                if (format == "tcx") response.setHeader("Content-Type", "application/vnd.garmin.tcx+xml; charset=ISO-8859-1");
-                if (format == "csv") response.setHeader("Content-Type", "text/csv; charset=ISO-8859-1");
-                if (format == "json") response.setHeader("Content-Type", "application/json; charset=ISO-8859-1");
-                if (format == "pwx") response.setHeader("Content-Type", "application/vnd.trainingpeaks.pwx+xml; charset=ISO-8859-1");
-            }
-
-            // lets read the file in as a ridefile
-            QStringList errors;
-            RideFile *f = RideFileFactory::instance().openRideFile(NULL, file, errors);
-
-            // error reading (!)
-            if (f == NULL) {
-                response.setStatus(500);
-                foreach(QString error, errors) {
-                    response.write(error.toLocal8Bit());
-                    response.write("\r\n");
-                }
-                return;
-            }
-
-            // write out to a temporary file in
-            // the format requested
-            bool success;
-            QTemporaryFile tempfile; // deletes file when goes out of scope
-            QString tempname;
-            if (tempfile.open()) tempname = tempfile.fileName();
-            else {
-                response.setStatus(500);
-                response.write("error opening temporary file");
-                return;
-            }
-            QFile out(tempname);
-
-            if (format == "csv") {
-                CsvFileReader writer;
-                success = writer.writeRideFile(NULL, f, out, CsvFileReader::gc);
-            } else {
-                success = RideFileFactory::instance().writeRideFile(NULL, f, out, format);
-            }
-
-            if (success) {
-
-                // read in the whole thing
-                out.open(QFile::ReadOnly | QFile::Text);
-                QTextStream in(&out);
-                in.setCodec ("UTF-8");
-                contents = in.readAll();
-                out.close();
-
-                // write back in one hit
-                response.write(contents.toLocal8Bit(), true);
-                return;
-
-            } else {
-                response.setStatus(500);
-                response.write("unable to write output, internal error.\n");
-                return;
-            }
+            response.setStatus(500);
+            response.write("unable to write output, internal error.\n");
+            return;
         }
 
     } else {
@@ -311,5 +399,210 @@ APIWebService::listMMP(QString athlete, QStringList paths, HttpRequest &request,
 {
     // list activities and associated metrics
     response.setHeader("Content-Type", "text; charset=ISO-8859-1");
-    response.write("get mmp under construction");
+
+    // what series do we want ?
+    QString seriesp = request.getParameter("series");
+    if (seriesp == "") seriesp = "watts";
+    RideFile::SeriesType series;
+
+    // what asked for ?
+    if (seriesp == "hr") series = RideFile::hr;
+    else if (seriesp == "cad") series = RideFile::cad;
+    else if (seriesp == "speed") series = RideFile::kph;
+    else if (seriesp == "watts") series = RideFile::watts;
+    else if (seriesp == "vam") series = RideFile::vam;
+    else if (seriesp == "NP") series = RideFile::NP;
+    else if (seriesp == "xPower") series = RideFile::xPower;
+    else if (seriesp == "nm") series = RideFile::nm;
+    else {
+
+        // unknown series
+        response.setStatus(500);
+        response.write("unknown series requested.\n");
+        return;
+    }
+
+    QString filename=paths[0];
+
+    if (paths[0] == "bests") {
+
+        // header
+        response.bwrite("secs, ");
+        response.bwrite(seriesp.toLocal8Bit());
+        response.bwrite("\n");
+
+        // honour the since parameter
+        QString sincep(request.getParameter("since"));
+        QDate since(1900,01,01);
+        if (sincep != "") since = QDate::fromString(sincep,"yyyy/MM/dd");
+
+        // before parameter
+        QString beforep(request.getParameter("before"));
+        QDate before(3000,01,01);
+        if (beforep != "") before = QDate::fromString(beforep,"yyyy/MM/dd");
+
+        int secs=0;
+        foreach(float value, RideFileCache::meanMaxFor(home.absolutePath() + "/" + athlete + "/cache", series, since, before)) {
+            if (secs >0) response.bwrite(QString("%1, %2\n").arg(secs).arg(value).toLocal8Bit());
+            secs++;
+        }
+
+
+    } else {
+        QString CPXfilename = home.absolutePath() + "/" + athlete + "/cache/" + QFileInfo(filename).completeBaseName() + ".cpx";
+
+        // header
+        response.bwrite("secs, ");
+        response.bwrite(seriesp.toLocal8Bit());
+        response.bwrite("\n");
+
+        if (QFileInfo(CPXfilename).exists()) {
+            int secs=0;
+            foreach(float value, RideFileCache::meanMaxFor(CPXfilename, series)) {
+                if (secs >0) response.bwrite(QString("%1, %2\n").arg(secs).arg(value).toLocal8Bit());
+                secs++;
+            }
+        }
+        response.flush();
+    }
+}
+
+void
+APIWebService::listZones(QString athlete, QStringList, HttpRequest &request, HttpResponse &response)
+{
+    // list activities and associated metrics
+    response.setHeader("Content-Type", "text; charset=ISO-8859-1");
+
+    // what zones we support
+    QStringList zonelist;
+    zonelist << "power" << "hr" << "pace" << "swimpace";
+
+    // what series do we want ?
+    QString zonesFor = request.getParameter("for");
+    if (zonesFor == "") zonesFor = "power";
+    else if (!zonelist.contains(zonesFor)) {
+        response.setStatus(404);
+        response.write("unknown zones type; one of power, hr, pace and swimpace expected.\n");
+        return;
+    }
+
+    // power zones
+    if (zonesFor == "power") {
+
+        // Power Zones
+        QFile zonesFile(home.absolutePath() + "/" + athlete + "/config/power.zones");
+        if (zonesFile.exists()) {
+            Zones *zones = new Zones;
+            if (zones->read(zonesFile)) {
+
+                // success - write out
+                response.write("date, cp, w', pmax\n");
+                for(int i=0; i<zones->getRangeSize(); i++) {
+                    response.write(
+                    QString("%1, %2, %3, %4\n")
+                           .arg(zones->getStartDate(i).toString("yyyy/MM/dd"))
+                           .arg(zones->getCP(i))
+                           .arg(zones->getWprime(i))
+                           .arg(zones->getPmax(i))
+                           .toLocal8Bit()
+                    );
+                }
+                return;
+            }
+        }
+
+        // drop here on fail
+        response.setStatus(500);
+        response.write("unable to read/parse the athlete's power.zones file.\n");
+        return;
+    }
+
+    // hr zones
+    if (zonesFor == "hr") {
+
+        // Zones
+        QFile zonesFile(home.absolutePath() + "/" + athlete + "/config/hr.zones");
+        if (zonesFile.exists()) {
+            HrZones *zones = new HrZones;
+            if (zones->read(zonesFile)) {
+
+                // success - write out
+                response.write("date, lthr, maxhr, rhr\n");
+                for(int i=0; i<zones->getRangeSize(); i++) {
+                    response.write(
+                    QString("%1, %2, %3, %4\n")
+                           .arg(zones->getStartDate(i).toString("yyyy/MM/dd"))
+                           .arg(zones->getLT(i))
+                           .arg(zones->getMaxHr(i))
+                           .arg(zones->getRestHr(i))
+                           .toLocal8Bit()
+                    );
+                }
+                return;
+            }
+        }
+
+        // drop here on fail
+        response.setStatus(500);
+        response.write("unable to read/parse the athlete's hr.zones file.\n");
+        return;
+    }
+
+    // pace zones
+    if (zonesFor == "pace") {
+
+        // Zones
+        QFile zonesFile(home.absolutePath() + "/" + athlete + "/config/run-pace.zones");
+        if (zonesFile.exists()) {
+            PaceZones *zones = new PaceZones;
+            if (zones->read(zonesFile)) {
+
+                // success - write out
+                response.write("date, CV\n");
+                for(int i=0; i<zones->getRangeSize(); i++) {
+                    response.write(
+                    QString("%1, %2\n")
+                           .arg(zones->getStartDate(i).toString("yyyy/MM/dd"))
+                           .arg(zones->getCV(i))
+                           .toLocal8Bit()
+                    );
+                }
+                return;
+            }
+        }
+
+        // drop here on fail
+        response.setStatus(500);
+        response.write("unable to read/parse the athlete's run-pace.zones file.\n");
+        return;
+    }
+
+    // swim pace zones
+    if (zonesFor == "swimpace") {
+
+        // Zones
+        QFile zonesFile(home.absolutePath() + "/" + athlete + "/config/swim-pace.zones");
+        if (zonesFile.exists()) {
+            PaceZones *zones = new PaceZones;
+            if (zones->read(zonesFile)) {
+
+                // success - write out
+                response.write("date, CV\n");
+                for(int i=0; i<zones->getRangeSize(); i++) {
+                    response.write(
+                    QString("%1, %2\n")
+                           .arg(zones->getStartDate(i).toString("yyyy/MM/dd"))
+                           .arg(zones->getCV(i))
+                           .toLocal8Bit()
+                    );
+                }
+                return;
+            }
+        }
+
+        // drop here on fail
+        response.setStatus(500);
+        response.write("unable to read/parse the athlete's swim-pace.zones file.\n");
+        return;
+    }
 }
